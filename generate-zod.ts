@@ -1,8 +1,44 @@
-import { Project, SyntaxKind, InterfaceDeclaration, TypeAliasDeclaration, EnumDeclaration, ModuleDeclaration, Type } from "ts-morph";
+import {
+  Project,
+  SyntaxKind,
+  InterfaceDeclaration,
+  TypeAliasDeclaration,
+  EnumDeclaration,
+  ModuleDeclaration,
+  Type,
+} from "ts-morph";
 import { writeFileSync } from "fs";
 
 // A lookup for enum types by their name (as declared in the Prisma types)
 const enumSchemas = new Map<string, string>();
+
+// A set of property names we want to filter out (e.g. Array prototype methods)
+const arrayMethodNames = new Set([
+  "pop",
+  "push",
+  "concat",
+  "join",
+  "reverse",
+  "shift",
+  "slice",
+  "sort",
+  "splice",
+  "unshift",
+  "indexOf",
+  "lastIndexOf",
+  "every",
+  "some",
+  "forEach",
+  "find",
+  "findIndex",
+  "filter",
+  "map",
+  "reduce",
+  "reduceRight",
+  "includes",
+  "flat",
+  "flatMap",
+]);
 
 /**
  * Generates a Zod schema for an enum declaration.
@@ -29,8 +65,22 @@ function generateEnumSchema(enumDecl: EnumDeclaration): string {
 
 /**
  * Recursively maps a ts-morph Type to a Zod schema string.
+ * A WeakSet is used to detect and break recursive cycles.
  */
-function mapTypeToZod(type: Type): string {
+function mapTypeToZod(type: Type, visited = new WeakSet<Type>()): string {
+  // Break recursion if this type has already been seen.
+  if (visited.has(type)) {
+    console.warn("Recursive type detected for: " + type.getText());
+    return "z.any()";
+  }
+  visited.add(type);
+
+  // *** NEW JSON CHECK ***
+  // If the type text includes "Json" (e.g. "Json", "Prisma.JsonValue", etc.), simply return z.any()
+  if (type.getText().includes("Json")) {
+    return "z.any()";
+  }
+
   // Check if the type text contains a reference to $Enums.
   const typeText = type.getText();
   const enumMatch = typeText.match(/\$Enums\.(\w+)/);
@@ -71,7 +121,7 @@ function mapTypeToZod(type: Type): string {
   // Array types (e.g., string[])
   const arrayElementType = type.getArrayElementType();
   if (arrayElementType) {
-    return `z.array(${mapTypeToZod(arrayElementType)})`;
+    return `z.array(${mapTypeToZod(arrayElementType, visited)})`;
   }
 
   // Union types (including unions with null)
@@ -93,15 +143,15 @@ function mapTypeToZod(type: Type): string {
     if (hasNull) {
       const nonNullTypes = unionTypes.filter((t) => !t.isNull());
       if (nonNullTypes.length === 1) {
-        return `${mapTypeToZod(nonNullTypes[0])}.nullable()`;
+        return `${mapTypeToZod(nonNullTypes[0], visited)}.nullable()`;
       } else {
-        const unionStrs = nonNullTypes.map((t) => mapTypeToZod(t));
+        const unionStrs = nonNullTypes.map((t) => mapTypeToZod(t, visited));
         return `z.union([${unionStrs.join(", ")}]).nullable()`;
       }
     }
 
     // Otherwise, a union of different types.
-    const unionStrs = unionTypes.map((t) => mapTypeToZod(t));
+    const unionStrs = unionTypes.map((t) => mapTypeToZod(t, visited));
     return `z.union([${unionStrs.join(", ")}])`;
   }
 
@@ -112,6 +162,8 @@ function mapTypeToZod(type: Type): string {
       let inner = "z.object({\n";
       properties.forEach((prop) => {
         const propName = prop.getName();
+        // Filter out "weird" internal properties and array prototype methods.
+        if (propName.startsWith("__@") || arrayMethodNames.has(propName)) return;
         const decls = prop.getDeclarations();
         if (decls.length > 0) {
           const propType = decls[0].getType();
@@ -120,7 +172,7 @@ function mapTypeToZod(type: Type): string {
             (decls[0].getKind() === SyntaxKind.PropertySignature &&
               (decls[0] as any).hasQuestionToken?.()) ||
             propType.getText().includes("undefined");
-          inner += `  ${propName}: ${mapTypeToZod(propType)}${isOptional ? ".optional()" : ""},\n`;
+          inner += `  ${propName}: ${mapTypeToZod(propType, visited)}${isOptional ? ".optional()" : ""},\n`;
         }
       });
       inner += "})";
@@ -138,9 +190,10 @@ function mapTypeToZod(type: Type): string {
 function generateZodSchemaFromInterface(interfaceDecl: InterfaceDeclaration): string {
   const interfaceName = interfaceDecl.getName();
   let schema = `export const ${interfaceName}Schema = z.object({\n`;
-
   interfaceDecl.getProperties().forEach((prop) => {
     const propName = prop.getName();
+    // Skip internal/array methods.
+    if (propName.startsWith("__@") || arrayMethodNames.has(propName)) return;
     const isOptional = prop.hasQuestionToken();
     const propType = prop.getType();
     schema += `  ${propName}: ${mapTypeToZod(propType)}${isOptional ? ".optional()" : ""},\n`;
@@ -155,13 +208,13 @@ function generateZodSchemaFromInterface(interfaceDecl: InterfaceDeclaration): st
 function generateZodSchemaFromTypeAlias(typeAliasDecl: TypeAliasDeclaration): string {
   const typeName = typeAliasDecl.getName();
   const type = typeAliasDecl.getType();
-
   if (type.isObject()) {
     const properties = type.getProperties();
     if (properties.length > 0) {
       let schema = `export const ${typeName}Schema = z.object({\n`;
       properties.forEach((prop) => {
         const propName = prop.getName();
+        if (propName.startsWith("__@") || arrayMethodNames.has(propName)) return;
         const decls = prop.getDeclarations();
         if (decls.length > 0) {
           const propType = decls[0].getType();
@@ -176,7 +229,6 @@ function generateZodSchemaFromTypeAlias(typeAliasDecl: TypeAliasDeclaration): st
       return schema;
     }
   }
-
   const zodType = mapTypeToZod(type);
   return `export const ${typeName}Schema = ${zodType};\n\n`;
 }
@@ -223,8 +275,6 @@ namespaceDeclarations.forEach((ns: ModuleDeclaration) => {
   });
 });
 
-
-
 // Process top-level exported declarations.
 const exportedDeclarations = prismaFile.getExportedDeclarations();
 exportedDeclarations.forEach((decls, name) => {
@@ -247,6 +297,6 @@ exportedDeclarations.forEach((decls, name) => {
   });
 });
 
-// Write the output file.
+// Write the generated schemas to a file.
 writeFileSync("prisma-zod-schemas.ts", output);
 console.log("Generated prisma-zod-schemas.ts");
